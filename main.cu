@@ -18,218 +18,185 @@
 
 **/
 
-#include <iostream>
+#include <memory>
+#include <time.h>
+#include <sys/stat.h>
+#include <signal.h>
+#include <cctype>
+#include <stdio.h>
+#include <string.h>
+#include <thread>
+#include <sstream>
+#include <stdexcept>
+#include <memory>
+#include <chrono>
 #include <numeric>
+
+#include <iostream>
 #include <sys/time.h>
 #include <vector>
 #include <stdlib.h>
 #include <typeinfo>
-#include <opencv2/opencv.hpp>
-
-#include <numeric>
-#include <stdlib.h>
 #include <ctime>
 #include <sys/types.h>
 #include <stdint.h>
 #include <linux/limits.h>
 #include <dirent.h>
-#include <iostream>
 #include <fstream>
+
+#include <opencv2/opencv.hpp>
+
+#include "camera/stereo_camera.hpp"
 #include "disparity_method.h"
 
-bool directory_exists(const char* dir) {
-	DIR* d = opendir(dir);
-	bool ok = false;
-	if(d) {
-	    closedir(d);
-	    ok = true;
-	}
-	return ok;
+static bool is_streaming = true;
+static void sig_handler(int sig)
+{
+    is_streaming = false;
 }
 
-void disparity_errors(cv::Mat estimation, const char* gt_file, int *n, int *n_err) {
-	int nlocal = 0;
-	int nerrlocal = 0;
+static cv::CommandLineParser getConfig(int argc, char **argv)
+{
+    const char *params = "{ help           | false              | print usage          }"
+                         "{ fps            | 30                 | (int) Frame rate }"
+                         "{ width          | 1280               | (int) Image width }"
+                         "{ height         | 720                | (int) Image height }";
 
-	cv::Mat gt_image = cv::imread(gt_file, cv::IMREAD_UNCHANGED);
-	if(!gt_image.data) {
-		std::cerr << "Couldn't read the file " << gt_file << std::endl;
-		exit(EXIT_FAILURE);
-	}
-	if(estimation.rows != gt_image.rows || estimation.cols != gt_image.cols) {
-		std::cerr << "Ground truth must have the same dimesions" << std::endl;
-		exit(EXIT_FAILURE);
-	}
-	const int type = estimation.type();
-	const uchar depth = type & CV_MAT_DEPTH_MASK;
-	for(int i = 0; i < gt_image.rows; i++) {
-		for(int j = 0; j < gt_image.cols; j++) {
-			const uint16_t gt = gt_image.at<uint16_t>(i, j);
-			if(gt > 0) {
-				const float gt_f = ((float)gt)/256.0f;
-				float est;
-				if(depth == CV_8U) {
-					est = (float) estimation.at<uint8_t>(i, j);
-				} else {
-					est = estimation.at<float>(i, j);
-				}
-				const float err = fabsf(est-gt_f);
-				const float ratio = err/fabsf(gt_f);
-				if(err > ABS_THRESH && ratio > REL_THRESH) {
-					nerrlocal++;
-				}
-				nlocal++;
-			}
-		}
-	}
-	*n += nlocal;
-	*n_err += nerrlocal;
+    cv::CommandLineParser config(argc, argv, params);
+    if (config.get<bool>("help"))
+    {
+        config.printMessage();
+        exit(0);
+    }
+
+    return config;
 }
 
-bool check_directories_exist(const char* directory, const char* left_dir, const char* right_dir, const char* disparity_dir) {
-	char left_dir_sub[PATH_MAX];
-	char right_dir_sub[PATH_MAX];
-	char disparity_dir_sub[PATH_MAX];
-	sprintf(left_dir_sub, "%s/%s", directory, left_dir);
-	sprintf(right_dir_sub, "%s/%s", directory, right_dir);
-	sprintf(disparity_dir_sub, "%s/%s", directory, disparity_dir);
+int main(int argc, char *argv[])
+{
+    // handle signal by user
+    struct sigaction act;
+    act.sa_handler = sig_handler;
+    sigaction(SIGINT, &act, NULL);
 
-	return directory_exists(left_dir_sub) && directory_exists(right_dir_sub) && directory_exists(disparity_dir_sub);
-}
+    // parse config from cmd
+    cv::CommandLineParser config = getConfig(argc, argv);
 
-int main(int argc, char *argv[]) {
-	if(argc < 4) {
-		std::cerr << "Usage: cuda_sgm dir p1 p2" << std::endl;
-		return -1;
-	}
-	if(MAX_DISPARITY != 128) {
-		std::cerr << "Due to implementation limitations MAX_DISPARITY must be 128" << std::endl;
-		return -1;
-	}
-	if(PATH_AGGREGATION != 4 && PATH_AGGREGATION != 8) {
-                std::cerr << "Due to implementation limitations PATH_AGGREGATION must be 4 or 8" << std::endl;
-                return -1;
+    StereoCameraConfig camConfig;
+    camConfig.fps = config.get<int>("fps");
+    camConfig.width = config.get<int>("width");
+    camConfig.height = config.get<int>("height");
+
+    StereoCamera::Ptr camera = std::make_shared<StereoCamera>(camConfig);
+    if (!camera->checkCameraStarted())
+    {
+        std::cout << "Camera open fail..." << std::endl;
+        return 0;
+    }
+
+    // Stereo Camera
+    cv::Mat frame_0, frame_1, frame_0_rect, frame_1_rect;
+    cv::Mat disp16, disp32;
+    StereoCameraData camDataCamera;
+
+    cv::FileStorage fs("ocams_calibration_720p.xml", cv::FileStorage::READ);
+
+    cv::Mat D_L, K_L, D_R, K_R;
+    cv::Mat Rect_L, Proj_L, Rect_R, Proj_R, Q;
+    cv::Mat baseline;
+    cv::Mat Rotation, Translation;
+
+    fs["D_L"] >> D_L;
+    fs["K_L"] >> K_L;
+    fs["D_R"] >> D_R;
+    fs["K_R"] >> K_R;
+    fs["baseline"] >> baseline;
+    fs["Rotation"] >> Rotation;
+    fs["Translation"] >> Translation;
+
+    // Code to calculate Rotation matrix and Projection matrix for each camera
+    cv::Vec3d Translation_2((double *)Translation.data);
+
+    cv::stereoRectify(K_L, D_L, K_R, D_R, cv::Size(camConfig.width, camConfig.height), Rotation, Translation_2,
+                      Rect_L, Rect_R, Proj_L, Proj_R, Q, cv::CALIB_ZERO_DISPARITY);
+
+    cv::Mat map11, map12, map21, map22;
+
+    cv::initUndistortRectifyMap(K_L, D_L, Rect_L, Proj_L, cv::Size(camConfig.width, camConfig.height), CV_32FC1, map11, map12);
+    cv::initUndistortRectifyMap(K_R, D_R, Rect_R, Proj_R, cv::Size(camConfig.width, camConfig.height), CV_32FC1, map21, map22);
+
+    if (MAX_DISPARITY != 128)
+    {
+        std::cerr << "Due to implementation limitations MAX_DISPARITY must be 128" << std::endl;
+        return -1;
+    }
+    if (PATH_AGGREGATION != 4 && PATH_AGGREGATION != 8)
+    {
+        std::cerr << "Due to implementation limitations PATH_AGGREGATION must be 4 or 8" << std::endl;
+        return -1;
+    }
+
+    std::vector<float> times;
+    float elapsed_time_ms;
+
+    init_disparity_method(0, 0);
+
+    while (1)
+    {
+        if (!is_streaming)
+        {
+            std::cout << "Exit by user signal" << std::endl;
+            break;
         }
-	const char* directory = argv[1];
-	uint8_t p1, p2;
-	p1 = atoi(argv[2]);
-	p2 = atoi(argv[3]);
+        if (camera->getCamData(camDataCamera))
+        {
+            frame_0 = camDataCamera.frame_0;
+            frame_1 = camDataCamera.frame_1;
 
-	DIR *dp;
-	struct dirent *ep;
+            cv::remap(frame_0, frame_0_rect, map11, map12, cv::INTER_LINEAR);
+            cv::remap(frame_1, frame_1_rect, map21, map22, cv::INTER_LINEAR);
 
-	// Directories
-	const char* left_dir = "left";
-	const char* disparity_dir = "disparities";
-	const char* right_dir = "right";
-	const char* gt_dir = "gt";
+            // Compute
+            cv::Mat disparity_im = compute_disparity_method(frame_0_rect, frame_1_rect, &elapsed_time_ms);
+            times.push_back(elapsed_time_ms);
 
-	if(!check_directories_exist(directory, left_dir, right_dir, disparity_dir)) {
-		std::cerr << "We need <left>, <right> and <disparities> directories" << std::endl;
-		exit(EXIT_FAILURE);
-	}
-	char abs_left_dir[PATH_MAX];
-    sprintf(abs_left_dir, "%s/%s", directory, left_dir);
-	dp = opendir(abs_left_dir);
-	if (dp == NULL) {
-		std::cerr << "Invalid directory: " << abs_left_dir << std::endl;
-		exit(EXIT_FAILURE);
-	}
-	char left_file[PATH_MAX];
-	char right_file[PATH_MAX];
-	char dis_file[PATH_MAX];
-	char gt_file[PATH_MAX];
-	char gt_dir_sub[PATH_MAX];
+            const int type = disparity_im.type();
+            const uchar depth = type & CV_MAT_DEPTH_MASK;
+            if (depth == CV_8U)
+            {
+                cv::Mat dispColor;
+                cv::applyColorMap(disparity_im, dispColor, cv::COLORMAP_JET);
+                cv::cvtColor(frame_0, frame_0, CV_GRAY2BGR);
+                cv::hconcat(dispColor, frame_0, dispColor);
+                cv::resize(dispColor, dispColor, cv::Size(1920, 720));
+                cv::imshow("disp8", dispColor);
+                cv::waitKey(1);
+            }
+            else
+            {
+                cv::Mat disparity16(disparity_im.rows, disparity_im.cols, CV_16UC1);
+                for (int i = 0; i < disparity_im.rows; i++)
+                {
+                    for (int j = 0; j < disparity_im.cols; j++)
+                    {
+                        const float d = disparity_im.at<float>(i, j) * 256.0f;
+                        disparity16.at<uint16_t>(i, j) = (uint16_t)d;
+                    }
+                }
+                cv::imshow("disp 16", disparity16);
+                cv::waitKey(1);
+            }
 
-	sprintf(gt_dir_sub, "%s/%s", directory, gt_dir);
-	const bool has_gt = directory_exists(gt_dir_sub);
-	int n = 0;
-	int n_err = 0;
-	std::vector<float> times;
+            if (times.size() % 100 == 0)
+            {
+                double mean = std::accumulate(times.begin(), times.end(), 0.0) / times.size();
+                std::cout << "It took an average of " << mean << " miliseconds, " << 1000.0f / mean << " fps" << std::endl;
+                times.clear();
+            }
+        }
+    }
 
-	init_disparity_method(p1, p2);
-	while ((ep = readdir(dp)) != NULL) {
-		// Skip directories
-		if (!strcmp (ep->d_name, "."))
-			continue;
-		if (!strcmp (ep->d_name, ".."))
-			continue;
+    finish_disparity_method();
 
-		sprintf(left_file, "%s/%s/%s", directory, left_dir, ep->d_name);
-		sprintf(right_file, "%s/%s/%s", directory, right_dir, ep->d_name);
-		sprintf(dis_file, "%s/%s/%s", directory, disparity_dir, ep->d_name);
-		sprintf(gt_file, "%s/%s/%s", directory, gt_dir, ep->d_name);
-		int gt_len = strlen(gt_file);
-
-		cv::Mat h_im0 = cv::imread(left_file);
-		if(!h_im0.data) {
-			std::cerr << "Couldn't read the file " << left_file << std::endl;
-			return EXIT_FAILURE;
-		}
-		cv::Mat h_im1 = cv::imread(right_file);
-		if(!h_im1.data) {
-			std::cerr << "Couldn't read the file " << right_file << std::endl;
-			return EXIT_FAILURE;
-		}
-
-		// Convert images to grayscale
-		if (h_im0.channels()>1) {
-			cv::cvtColor(h_im0, h_im0, CV_RGB2GRAY);
-		}
-
-		if (h_im1.channels()>1) {
-			cv::cvtColor(h_im1, h_im1, CV_RGB2GRAY);
-		}
-
-		if(h_im0.rows != h_im1.rows || h_im0.cols != h_im1.cols) {
-			std::cerr << "Both images must have the same dimensions" << std::endl;
-			return EXIT_FAILURE;
-		}
-		if(h_im0.rows % 4 != 0 || h_im0.cols % 4 != 0) {
-                        std::cerr << "Due to implementation limitations image width and height must be a divisible by 4" << std::endl;
-                        return EXIT_FAILURE;
-		}
-
-#if LOG
-		std::cout << "processing: " << left_file << std::endl;
-#endif
-		// Compute
-		float elapsed_time_ms;
-		cv::Mat disparity_im = compute_disparity_method(h_im0, h_im1, &elapsed_time_ms, directory, ep->d_name);
-#if LOG
-		std::cout << "done" << std::endl;
-#endif
-		times.push_back(elapsed_time_ms);
-
-		if(has_gt) {
-			disparity_errors(disparity_im, gt_file, &n, &n_err);
-		}
-#if WRITE_FILES
-	const int type = disparity_im.type();
-	const uchar depth = type & CV_MAT_DEPTH_MASK;
-	if(depth == CV_8U) {
-		cv::imwrite(dis_file, disparity_im);
-	} else {
-		cv::Mat disparity16(disparity_im.rows, disparity_im.cols, CV_16UC1);
-		for(int i = 0; i < disparity_im.rows; i++) {
-			for(int j = 0; j < disparity_im.cols; j++) {
-				const float d = disparity_im.at<float>(i, j)*256.0f;
-				disparity16.at<uint16_t>(i, j) = (uint16_t) d;
-			}
-		}
-		cv::imwrite(dis_file, disparity16);
-	}
-#endif
-	}
-	closedir(dp);
-	finish_disparity_method();
-
-	double mean = std::accumulate(times.begin(), times.end(), 0.0) / times.size();
-	if(has_gt) {
-		printf("%f\n", (float) n_err/n);
-	} else {
-		std::cout << "It took an average of " << mean << " miliseconds, " << 1000.0f/mean << " fps" << std::endl;
-	}
-
-	return 0;
+    return 0;
 }

@@ -22,11 +22,12 @@
 #define CONFIGURATION_H_
 
 #include <stdint.h>
+#include <cuda_runtime.h>
 
 #define LOG						false
 #define WRITE_FILES				true
 
-#define PATH_AGGREGATION	4
+#define PATH_AGGREGATION	8
 #define	MAX_DISPARITY		128
 #define CENSUS_WIDTH		9
 #define CENSUS_HEIGHT		7

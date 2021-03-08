@@ -21,6 +21,7 @@
 #ifndef UTIL_H_
 #define UTIL_H_
 
+#include <cuda_runtime.h>
 #include <iostream>
 #include <dirent.h>
 #include <stdio.h>
