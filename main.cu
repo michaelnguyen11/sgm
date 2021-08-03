@@ -47,7 +47,7 @@
 #include <opencv2/opencv.hpp>
 
 #include "camera/stereo_camera.hpp"
-#include "disparity_method.h"
+#include "sgm_cuda/disparity_method.h"
 
 static bool is_streaming = true;
 static void sig_handler(int sig)
@@ -166,11 +166,13 @@ int main(int argc, char *argv[])
             {
                 cv::Mat dispColor;
                 cv::applyColorMap(disparity_im, dispColor, cv::COLORMAP_JET);
-                cv::cvtColor(frame_0, frame_0, CV_GRAY2BGR);
+                cv::cvtColor(frame_0, frame_0, cv::COLOR_GRAY2BGR);
                 cv::hconcat(dispColor, frame_0, dispColor);
                 cv::resize(dispColor, dispColor, cv::Size(1920, 720));
                 cv::imshow("disp8", dispColor);
-                cv::waitKey(1);
+                char key = (char)cv::waitKey(25);
+                if (key == 27)
+                    break;
             }
             else
             {
@@ -184,7 +186,9 @@ int main(int argc, char *argv[])
                     }
                 }
                 cv::imshow("disp 16", disparity16);
-                cv::waitKey(1);
+                char key = (char)cv::waitKey(25);
+                if (key == 27)
+                    break;
             }
 
             if (times.size() % 100 == 0)

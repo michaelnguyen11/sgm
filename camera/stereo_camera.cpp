@@ -92,8 +92,8 @@ bool StereoCamera::getCamData(StereoCameraData &camData)
         cv::Mat stereo_raw[2];
         cv::split(temp, stereo_raw);
 
-        cv::cvtColor(stereo_raw[1], camData.frame_0, CV_BayerGR2GRAY);
-        cv::cvtColor(stereo_raw[0], camData.frame_1, CV_BayerGR2GRAY);
+        cv::cvtColor(stereo_raw[1], camData.frame_0, cv::COLOR_BayerGR2GRAY);
+        cv::cvtColor(stereo_raw[0], camData.frame_1, cv::COLOR_BayerGR2GRAY);
 
         return true;
     }
